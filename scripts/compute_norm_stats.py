@@ -1,75 +1,79 @@
-"""Compute normalization statistics for a config.
+import dataclasses
 
-This script is used to compute the normalization statistics for a given config. It
-will compute the mean and standard deviation of the data in the dataset and save it
-to the config assets directory.
-"""
-
+import einops
 import numpy as np
-import tqdm
-import tyro
 
-import openpi.shared.normalize as normalize
-import openpi.training.config as _config
-import openpi.training.data_loader as _data_loader
-import openpi.transforms as transforms
+from openpi import transforms
+from openpi.models import model as _model
 
 
-class RemoveStrings(transforms.DataTransformFn):
-    def __call__(self, x: dict) -> dict:
-        return {k: v for k, v in x.items() if not np.issubdtype(np.asarray(v).dtype, np.str_)}
+def make_droid_example() -> dict:
+    """Creates a random input example for the Droid policy."""
+    return {
+        "observation/exterior_image_1_right": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "observation/wrist_image_left": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "observation/joint_position": np.random.rand(7),
+        "observation/gripper_position": np.random.rand(1),
+        "prompt": "do something",
+    }
 
 
-def create_dataset(config: _config.TrainConfig) -> tuple[_config.DataConfig, _data_loader.Dataset]:
-    data_config = config.data.create(config.assets_dirs, config.model)
-    if data_config.repo_id is None:
-        raise ValueError("Data config must have a repo_id")
-    dataset = _data_loader.create_dataset(data_config, config.model)
-    dataset = _data_loader.TransformedDataset(
-        dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
-            RemoveStrings(),
-        ],
-    )
-    return data_config, dataset
+def _parse_image(image) -> np.ndarray:
+    image = np.asarray(image)
+    if np.issubdtype(image.dtype, np.floating):
+        image = (255 * image).astype(np.uint8)
+    if image.shape[0] == 3:
+        image = einops.rearrange(image, "c h w -> h w c")
+    return image
 
 
-def main(config_name: str, max_frames: int | None = None):
-    config = _config.get_config(config_name)
-    data_config, dataset = create_dataset(config)
+@dataclasses.dataclass(frozen=True)
+class DroidInputs(transforms.DataTransformFn):
+    # The action dimension of the model. Will be used to pad state and actions.
+    action_dim: int
 
-    num_frames = len(dataset)
-    shuffle = False
+    # Determines which model will be used.
+    model_type: _model.ModelType = _model.ModelType.PI0
 
-    if max_frames is not None and max_frames < num_frames:
-        num_frames = max_frames
-        shuffle = True
+    def __call__(self, data: dict) -> dict:
+        state = np.concatenate([data["observation/joint_position"], [data["observation/gripper_position"]]])
+        state = transforms.pad_to_dim(state, self.action_dim)
 
-    data_loader = _data_loader.TorchDataLoader(
-        dataset,
-        local_batch_size=1,
-        num_workers=8,
-        shuffle=shuffle,
-        num_batches=num_frames,
-    )
+        # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
+        # stores as float32 (C,H,W), gets skipped for policy inference
+        base_image = _parse_image(data["observation/exterior_image_1_right"])
+        wrist_image = _parse_image(data["observation/wrist_image_left"])
 
-    keys = ["state", "actions"]
-    stats = {key: normalize.RunningStats() for key in keys}
+        match self.model_type:
+            case _model.ModelType.PI0:
+                names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+                images = (base_image, wrist_image, np.zeros_like(base_image))
+                image_masks = (np.True_, np.True_, np.False_)
+            case _model.ModelType.PI0_FAST:
+                names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
+                # We don't mask out padding images for FAST models.
+                images = (base_image, np.zeros_like(base_image), wrist_image)
+                image_masks = (np.True_, np.True_, np.True_)
+            case _:
+                raise ValueError(f"Unsupported model type: {self.model_type}")
 
-    for batch in tqdm.tqdm(data_loader, total=num_frames, desc="Computing stats"):
-        for key in keys:
-            values = np.asarray(batch[key][0])
-            stats[key].update(values.reshape(-1, values.shape[-1]))
+        inputs = {
+            "state": state,
+            "image": dict(zip(names, images, strict=True)),
+            "image_mask": dict(zip(names, image_masks, strict=True)),
+        }
 
-    norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+        if "actions" in data:
+            inputs["actions"] = transforms.pad_to_dim(data["actions"],self.action_dim)
 
-    output_path = config.assets_dirs / data_config.repo_id
-    print(f"Writing stats to: {output_path}")
-    normalize.save(output_path, norm_stats)
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
 
 
-if __name__ == "__main__":
-    tyro.cli(main)
+@dataclasses.dataclass(frozen=True)
+class DroidOutputs(transforms.DataTransformFn):
+    def __call__(self, data: dict) -> dict:
+        # Only return the first 8 dims.
+        return {"actions": np.asarray(data["actions"][:, :32])}

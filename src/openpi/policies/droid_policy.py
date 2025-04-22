@@ -10,7 +10,7 @@ from openpi.models import model as _model
 def make_droid_example() -> dict:
     """Creates a random input example for the Droid policy."""
     return {
-        "observation/exterior_image_1_left": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "observation/exterior_image_1_right": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/wrist_image_left": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/joint_position": np.random.rand(7),
         "observation/gripper_position": np.random.rand(1),
@@ -36,12 +36,12 @@ class DroidInputs(transforms.DataTransformFn):
     model_type: _model.ModelType = _model.ModelType.PI0
 
     def __call__(self, data: dict) -> dict:
-        state = np.concatenate([data["observation/joint_position"], data["observation/gripper_position"]])
+        state = np.concatenate([data["observation/joint_position"], [data["observation/gripper_position"]]])
         state = transforms.pad_to_dim(state, self.action_dim)
 
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
         # stores as float32 (C,H,W), gets skipped for policy inference
-        base_image = _parse_image(data["observation/exterior_image_1_left"])
+        base_image = _parse_image(data["observation/exterior_image_1_right"])
         wrist_image = _parse_image(data["observation/wrist_image_left"])
 
         match self.model_type:
@@ -64,7 +64,7 @@ class DroidInputs(transforms.DataTransformFn):
         }
 
         if "actions" in data:
-            inputs["actions"] = data["actions"]
+            inputs["actions"] = transforms.pad_to_dim(data["actions"],self.action_dim)
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
@@ -76,4 +76,4 @@ class DroidInputs(transforms.DataTransformFn):
 class DroidOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         # Only return the first 8 dims.
-        return {"actions": np.asarray(data["actions"][:, :8])}
+        return {"actions": np.asarray(data["actions"][:, :32])}
