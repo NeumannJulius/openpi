@@ -84,6 +84,10 @@ class FakeDataset(Dataset):
 def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseModelConfig) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
+    print(data_config.eval_repo_id)
+    if(data_config.eval_repo_id != None):
+        eval_repo_id = data_config.eval_repo_id
+
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
@@ -92,6 +96,7 @@ def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseMod
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, local_files_only=data_config.local_files_only)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(model_config.action_horizon)]
             for key in data_config.action_sequence_keys
@@ -99,10 +104,27 @@ def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseMod
         local_files_only=data_config.local_files_only,
     )
 
+
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
-    return dataset
+
+    if eval_repo_id:
+        eval_dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(eval_repo_id, local_files_only=data_config.local_files_only)
+        eval_dataset = lerobot_dataset.LeRobotDataset(
+            data_config.eval_repo_id,
+
+            delta_timestamps={
+                key: [t / eval_dataset_meta.fps for t in range(model_config.action_horizon)]
+                for key in data_config.action_sequence_keys
+            },
+            local_files_only=data_config.local_files_only,
+        )
+
+        if data_config.prompt_from_task:
+           eval_dataset = TransformedDataset(eval_dataset, [_transforms.PromptFromLeRobotTask(eval_dataset_meta.tasks)])
+
+    return dataset, eval_dataset
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
@@ -135,7 +157,7 @@ def create_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     num_workers: int = 0,
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+) -> tuple[DataLoader[tuple[_model.Observation, _model.Actions]],DataLoader[tuple[_model.Observation, _model.Actions]]]:
     """Create a data loader for training.
 
     Args:
@@ -152,12 +174,26 @@ def create_data_loader(
     """
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    dataset = create_dataset(data_config, config.model)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
-    data_loader = TorchDataLoader(
-        dataset,
-        local_batch_size=config.batch_size // jax.process_count(),
+    dataset, eval_dataset = create_dataset(data_config, config.model)
+    
+    train_ds = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    eval_ds= transform_dataset(eval_dataset, data_config, skip_norm_stats=skip_norm_stats)
+    
+
+    train_loader = TorchDataLoader(
+        train_ds,
+        local_batch_size=(config.batch_size // jax.process_count() ),# // 4,
+        sharding=sharding,
+        shuffle=shuffle,
+        num_batches=num_batches,
+        num_workers=num_workers,
+        seed=config.seed,
+    )
+
+    eval_loader =TorchDataLoader(
+        eval_ds,
+        local_batch_size=(config.batch_size // jax.process_count() ),# // 4,
         sharding=sharding,
         shuffle=shuffle,
         num_batches=num_batches,
@@ -177,7 +213,7 @@ def create_data_loader(
             for batch in self._data_loader:
                 yield _model.Observation.from_dict(batch), batch["actions"]
 
-    return DataLoaderImpl(data_config, data_loader)
+    return DataLoaderImpl(data_config, train_loader),DataLoaderImpl(data_config, eval_loader)
 
 
 class TorchDataLoader:

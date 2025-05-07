@@ -83,6 +83,30 @@ class AdamW(OptimizerConfig):
 
         return optax.chain(optax.clip_by_global_norm(self.clip_gradient_norm), tx)
 
+@dataclasses.dataclass(frozen=True)
+class MultiStepAdamW(OptimizerConfig):
+    """Mutistep"""
+
+    b1: float = 0.9
+    b2: float = 0.95
+    eps: float = 1e-8
+    weight_decay: float = 1e-10
+    clip_gradient_norm: float = 1.0
+
+    def create(
+        self,
+        lr: optax.ScalarOrSchedule,
+        weight_decay_mask: at.PyTree | None = None,
+    ) -> optax.GradientTransformation:
+        tx = optax.adamw(
+            lr, b1=self.b1, b2=self.b2, eps=self.eps, weight_decay=self.weight_decay, mask=weight_decay_mask
+        )
+
+        tx = optax.MultiSteps(tx, every_k_schedule=4)
+
+        return optax.chain(optax.clip_by_global_norm(self.clip_gradient_norm), tx)
+
+
 
 @dataclasses.dataclass(frozen=True)
 class SGD(OptimizerConfig):

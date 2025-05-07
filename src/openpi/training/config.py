@@ -62,6 +62,8 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+
+    eval_repo_id: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -138,6 +140,8 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
+    eval_repo_id: str = None
+
     # Determines how the assets will be loaded.
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     # Base config that will be updated by the factory.
@@ -149,10 +153,12 @@ class DataConfigFactory(abc.ABC):
 
     def create_base_config(self, assets_dirs: pathlib.Path) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+        eval_repo_id = self.eval_repo_id if self.eval_repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
+            eval_repo_id=eval_repo_id,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
         )
@@ -374,7 +380,7 @@ class TrainConfig:
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
-    num_workers: int = 2
+    num_workers: int = 4
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -401,6 +407,9 @@ class TrainConfig:
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
+    
+    # accum_steps: int = 4  
+    # eval_split: float = 0.4
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -486,8 +495,8 @@ _CONFIGS = [
         freeze_filter=pi0.Pi0Config(
              action_expert_variant="gemma_300m",paligemma_variant="gemma_2b_lora"
         ).get_freeze_filter(),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_droid/params"),
-        num_train_steps=20_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("./checkpoints/pi0_droid_train_lora_touch_orange_cube/EAS_IIS/custom_droid_mcap_1_touch_orange_cube/19999/params"),
+        num_train_steps=80_000,
         ema_decay=None,
         wandb_enabled=True,
     ),
@@ -508,6 +517,59 @@ _CONFIGS = [
         ).get_freeze_filter(),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_droid/params"),
         num_train_steps=20_000,
+        ema_decay=None,
+        wandb_enabled=True,
+    ),
+
+    TrainConfig(
+        name="pi0_droid_train_full_touch_orange_cube_ext_512",
+        model=pi0.Pi0Config(action_horizon=10, action_expert_variant="gemma_300m",paligemma_variant="gemma_2b_lora"),
+        data=CustomDroidDataConfig(
+            repo_id="EAS_IIS/custom_droid_touch_orange_cube_ext",
+            eval_repo_id="EAS_IIS/custom_droid_touch_orange_cube_ext_eval",
+            assets=AssetsConfig(assets_dir="./assets/pi0_droid_train",asset_id="EAS_IIS/custom_droid_touch_orange_cube_ext"),
+            default_prompt="Dont do stupid shit",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_only=True
+            ),
+        ),
+        freeze_filter=pi0.Pi0Config(action_expert_variant="gemma_300m",paligemma_variant="gemma_2b_lora").get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_droid/params"),
+        num_train_steps=30_000,
+        batch_size=512,
+        log_interval=10,
+        save_interval=100,
+        keep_period=200,
+        # optimizer = _optimizer.MultiStepAdamW,
+        # lr_schedule = _optimizer.CosineDecaySchedule,
+        # accum_steps = 4,
+        ema_decay=None,
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_droid_train_full_touch_orange_cube_ext_32",
+        model=pi0.Pi0Config(action_horizon=10, action_expert_variant="gemma_300m",paligemma_variant="gemma_2b_lora"),
+        data=CustomDroidDataConfig(
+            repo_id="EAS_IIS/custom_droid_touch_orange_cube_ext",
+            eval_repo_id="EAS_IIS/custom_droid_touch_orange_cube_ext_eval",
+            assets=AssetsConfig(assets_dir="./assets/pi0_droid_train",asset_id="EAS_IIS/custom_droid_touch_orange_cube_ext"),
+            default_prompt="Dont do stupid shit",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_files_only=True
+            ),
+        ),
+        freeze_filter=pi0.Pi0Config(action_expert_variant="gemma_300m",paligemma_variant="gemma_2b_lora").get_freeze_filter(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_droid/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        log_interval=10,
+        save_interval=1000,
+        keep_period=5000,
+        # optimizer = _optimizer.MultiStepAdamW,
+        # lr_schedule = _optimizer.CosineDecaySchedule,
+        # accum_steps = 4,
         ema_decay=None,
         wandb_enabled=True,
     ),

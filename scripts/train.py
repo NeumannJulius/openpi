@@ -1,5 +1,6 @@
 import dataclasses
 import functools
+import itertools
 import logging
 import platform
 from typing import Any
@@ -86,6 +87,7 @@ def init_train_state(
 ) -> tuple[training_utils.TrainState, Any]:
     tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
 
+
     def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
         rng, model_rng = jax.random.split(rng)
         # initialize the model (and its parameters).
@@ -131,6 +133,30 @@ def init_train_state(
 
     return train_state, state_sharding
 
+@at.typecheck
+def eval_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> dict[str, at.Array]:
+    # Modell in Inferenzmodus
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+
+    # Loss-Funktion
+    @at.typecheck
+    def loss_fn(
+        model: _model.BaseModel, observation: _model.Observation, actions: _model.Actions
+    ):
+        chunked_loss = model.compute_loss(rng, observation, actions, train=False)
+        return jnp.mean(chunked_loss)
+
+    observation, actions = batch
+    loss = loss_fn(model, observation, actions)
+    return {"eval_loss": loss}
+
+
 
 @at.typecheck
 def train_step(
@@ -138,19 +164,32 @@ def train_step(
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
-) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    eval:bool
+) -> tuple[training_utils.TrainState, dict[str, at.Array]]|dict[str, at.Array]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
+
+
     @at.typecheck
     def loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
+        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions,eval=False
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        chunked_loss = model.compute_loss(rng, observation, actions, train=eval)
         return jnp.mean(chunked_loss)
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
+    
+    if(eval):
+        # return "1"
+        model.eval()
+        loss = loss_fn(model, train_rng,observation, actions,eval=True)
+        return state, {"eval_loss": loss}
+
+
+
+    # print(f"{actions=}") 
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
@@ -187,10 +226,13 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+    # print(info)
     return new_state, info
 
 
 def main(config: _config.TrainConfig):
+
+
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
@@ -199,7 +241,7 @@ def main(config: _config.TrainConfig):
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/../../scratch/jneumann/cache/jax").expanduser())) #str(epath.Path("~/.cache/jax").expanduser())
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
@@ -215,15 +257,17 @@ def main(config: _config.TrainConfig):
         resume=config.resume,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
-
-    data_loader = _data_loader.create_data_loader(
+    # print(f"{config=}")
+    train_loader, eval_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
         num_workers=config.num_workers,
         shuffle=True,
     )
-    data_iter = iter(data_loader)
-    batch = next(data_iter)
+    train_iter = iter(train_loader)
+    eval_iter = iter(eval_loader)
+
+    batch = next(train_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
@@ -231,14 +275,16 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, train_loader)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
+        static_argnums=(3,),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -250,20 +296,35 @@ def main(config: _config.TrainConfig):
 
     infos = []
     for step in pbar:
-        with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.append(info)
-        if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
-        batch = next(data_iter)
+        try:
+            with sharding.set_mesh(mesh):
+                # print(batch[1][0])
+                train_state, info = ptrain_step(train_rng, train_state, batch,False)
+            infos.append(info)
+            if step % config.log_interval == 0:
+                with sharding.set_mesh(mesh):
+                    eval_losses = []
+                    eval_batch = next(eval_iter)
+                    train_state, eval_info = ptrain_step(train_rng, train_state,eval_batch,True)
+                    print(f"{eval_info=}")
+                    eval_losses.append(eval_info["eval_loss"])
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+                mean_eval_loss = float(jnp.mean(jnp.array(eval_losses)))
+                stacked_infos = common_utils.stack_forest(infos)
+                reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+                reduced_info["eval_loss"] = mean_eval_loss
+                info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+                pbar.write(f"Step {step}: {info_str}")
+                wandb.log(reduced_info, step=step)
+                infos = []
+
+            batch = next(train_iter)
+
+            if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+                _checkpoints.save_state(checkpoint_manager, train_state, train_loader, step)
+        except Exception as e:
+            print(e.with_traceback())
+
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
